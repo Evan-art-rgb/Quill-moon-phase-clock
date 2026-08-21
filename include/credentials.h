@@ -6,5 +6,5 @@
 // make sure this file is excluded via .gitignore -- it already is
 // in this project.
 
-const char *WIFI_SSID = "ABIDS";
-const char *WIFI_PASSWORD = "12392188";
+const char *WIFI_SSID = "your-wifi-name";
+const char *WIFI_PASSWORD = "your-wifi-password";
