@@ -1,53 +1,89 @@
-# Moon Phase Clock
+# Quill Moon Phase Clock
 
-An ESP32-powered round-display clock that shows the current time, date, and real-time moon phase — fetched from NASA's Dial-a-Moon API and rendered with a 30-frame moon image cycle.
+An ESP32-powered round-display clock showing the current time, date and real-time moon phase on a 240×240 GC9A01 display.
 
-This project is an adaptation of a project from [nishad2m8](https://github.com/nishad2m8) 
+This version uses a **non-blocking architecture** so that Wi-Fi connection, NTP synchronisation and NASA moon-data retrieval do not interrupt the display or user interface.
+
+Moon phase data is obtained from NASA's Dial-a-Moon API and rendered using a 30-frame moon image cycle.
+
+## Credits
+
+This project is based on the **Moon Phase Clock** project by **nishad2m8**:
+
+https://github.com/nishad2m8
+
+The Quill version retains the original LVGL/SquareLine user interface and moon imagery while adding hardware configuration changes and a non-blocking networking architecture for the ESP32.
 
 ## Features
 
-- Live time & date via NTP.
-- Current moon phase name + matching moon image, pulled from NASA's Dial-a-Moon API
-- Built with LVGL 8.3.11 UI designed in SquareLine Studio
+- 240×240 round GC9A01 display
+- Live local time and date via NTP
+- Automatic timezone and daylight-saving handling
+- Current moon phase from NASA's Dial-a-Moon API
+- 30-frame moon phase image cycle
+- Eight named lunar phases
+- Three-second moon animation at startup
+- Non-blocking Wi-Fi connection and reconnection
+- Non-blocking NTP synchronisation
+- NASA HTTPS requests performed in a background FreeRTOS task
+- Display remains responsive during network operations
+- Automatic retry following network or API failure
+- LVGL 8.3.11 user interface
+- SquareLine Studio generated UI
+- PlatformIO build environment
 
 ## Hardware
 
-- ESP32 WROOM dev board
+- ESP32 WROOM development board
 - GC9A01 240×240 round SPI display
 
 ## Wiring
 
 | Display Pin | ESP32 GPIO |
-|---|---|
-| MOSI | 17 |
-| SCLK | 16 |
-| CS | 22 |
-| DC | 21 |
-| RST | 27 |
-| BL | Not used (always on) |
+|-------------|------------|
+| VCC | 3.3V |
+| GND | GND |
+| MOSI / SDA | GPIO 23 |
+| SCLK / SCL | GPIO 18 |
+| CS | GPIO 5 |
+| DC | GPIO 2 |
+| RST / RES | GPIO 4 |
+| BL / BLK | 3.3V |
 | MISO | Not connected |
 
-## Setup Instructions
+The display uses hardware SPI.
 
-1. **Open the project** in PlatformIO (VS Code extension).
-2. **Add your WiFi credentials.** Open `include/credentials.h` and fill in:
-   ```cpp
-   #define WIFI_SSID "your-wifi-name"
-   #define WIFI_PASSWORD "your-wifi-password"
-   ```
-3. **Wire the display** to the ESP32 per the table above.
-4. **Build & upload** using PlatformIO (`esp32dev` environment is pre-configured for the GC9A01 driver).
-5. **Power on.** The moon animation plays for 3 seconds on boot, then the clock connects to WiFi, syncs time via NTP, and fetches the current moon phase.
+## Software
 
-## How It Works
+The project is built using PlatformIO with the Arduino framework.
 
-- Time and date update every second from the ESP32's system clock (kept accurate via periodic NTP sync).
-- Moon phase data is fetched from NASA's Dial-a-Moon API:
-  - Every **15 seconds** until the first successful fetch.
-  - Every **1 hour** afterward, since moon age changes negligibly minute-to-minute.
-- The moon's age (in days) is mapped to one of 30 image frames and an 8-phase name (New Moon, Waxing Crescent, First Quarter, Waxing Gibbous, Full Moon, Waning Gibbous, Last Quarter, Waning Crescent) using evenly-spaced day thresholds.
+Main libraries:
 
-## Notes
+- LVGL 8.3.11
+- TFT_eSPI 2.5.43
+- ArduinoJson 6.x
+- ESP32 WiFi
+- HTTPClient
+- WiFiClientSecure
 
-- If colors look swapped, toggle `TFT_RGB_ORDER` in `platformio.ini`.
-- If the display appears upside down, change `tft.setRotation(2)` in `main.cpp` to `0`.
+## Configuration
+
+Local configuration is stored in:
+
+`include/secrets.h`
+
+This file should **not be committed to Git**.
+
+Create it from the supplied `secrets.example.h` and enter your own settings:
+
+```cpp
+#ifndef SECRETS_H
+#define SECRETS_H
+
+const char* WIFI_SSID = "YOUR_WIFI_SSID";
+const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+
+const char* TIMEZONE =
+    "NZST-12NZDT,M9.5.0,M4.1.0/3";
+
+#endif
