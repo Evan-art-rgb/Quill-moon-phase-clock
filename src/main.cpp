@@ -1,15 +1,14 @@
 /**
- * Moon Phase
- * ESP32 WROOM + GC9A01 240x240 round (SPI, TFT_eSPI) + LVGL 8.3.11
- * Credit to nishad2m8 https://github.com/nishad2m8
- * What this does:
- *  - Connects to WiFi, syncs time via NTP
- *  - Updates the time/date labels every second from the system clock
- *  - Periodically fetches the current moon age from NASA's Dial-a-Moon API
- *    and updates the phase name label + moon image accordingly
+ * Quill Moon Clock v1.1 - non-blocking edition
+ * ESP32 WROOM + GC9A01 240x240 + LVGL 8.3.11
+ * Based on Moon Phase Clock by nishad2m8: https://github.com/nishad2m8
  *
- * NOTE: TFT pin mapping lives in platformio.ini build_flags.
- * Fill in your WiFi details in include/credentials.h before uploading.
+ * Quill changes:
+ *  - Non-blocking Wi-Fi connection/reconnection state machine
+ *  - Non-blocking NTP wait (system SNTP runs in background)
+ *  - Non-blocking moon intro animation
+ *  - NASA HTTPS/JSON work moved off the LVGL loop to a FreeRTOS worker task
+ *  - LVGL is touched only by the main task
  */
 
 #include <Arduino.h>
@@ -20,35 +19,29 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <time.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
 #include "ui.h"
-#include "credentials.h"
+#include "secrets.h"
 
 TFT_eSPI tft = TFT_eSPI();
-
-// ---- Time zone ----
-
-// POSIX TZ format: "<+06>-6" means UTC+6, no DST. use "<+01>-1" for UTC +1, "<-05>5" for UTC -5
-const char *TIMEZONE = "<+06>-6"; 
 const char *NTP_SERVER = "pool.ntp.org";
 
-// ---- LVGL display buffer (partial, single buffer, internal RAM only) ----
 static lv_disp_draw_buf_t draw_buf;
 static lv_color_t buf1[240 * 40];
 static lv_disp_drv_t disp_drv;
 
 static void disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color_p)
 {
-    uint32_t w = (area->x2 - area->x1 + 1);
-    uint32_t h = (area->y2 - area->y1 + 1);
-
+    uint32_t w = area->x2 - area->x1 + 1;
+    uint32_t h = area->y2 - area->y1 + 1;
     tft.startWrite();
     tft.setAddrWindow(area->x1, area->y1, w, h);
     tft.pushColors((uint16_t *)&color_p->full, w * h, true);
     tft.endWrite();
-
     lv_disp_flush_ready(disp);
 }
-
 
 static const lv_img_dsc_t *moon_frames[30] = {
     &ui_img_moon_moon_1_png,  &ui_img_moon_moon_2_png,  &ui_img_moon_moon_3_png,
@@ -63,36 +56,58 @@ static const lv_img_dsc_t *moon_frames[30] = {
     &ui_img_moon_moon_28_png, &ui_img_moon_moon_29_png, &ui_img_moon_moon_30_png,
 };
 
-// ---- Update timers ----
-const uint32_t CLOCK_UPDATE_MS = 1000;                 // refresh time/date label every second
-const uint32_t MOON_UPDATE_MS = 60UL * 60UL * 1000UL;  // refetch moon phase hourly once we have a
-                                                        // successful reading (moon age barely moves
-                                                        // minute to minute)
-const uint32_t MOON_RETRY_MS = 15UL * 1000UL;          // retry this often until the FIRST fetch succeeds
+constexpr uint32_t CLOCK_UPDATE_MS = 1000;
+constexpr uint32_t MOON_UPDATE_MS = 60UL * 60UL * 1000UL;
+constexpr uint32_t MOON_RETRY_MS = 15UL * 1000UL;
+constexpr uint32_t WIFI_RETRY_MS = 30UL * 1000UL;
+constexpr uint32_t WIFI_CONNECT_TIMEOUT_MS = 20UL * 1000UL;
+constexpr uint32_t INTRO_FRAME_MS = 100;
 
 static uint32_t lastClockMillis = 0;
-static uint32_t lastMoonMillis = 0;
+static uint32_t lastMoonAttemptMillis = 0;
+static uint32_t wifiAttemptMillis = 0;
 static bool moonDataValid = false;
+static bool ntpConfigured = false;
+static bool timeWasValid = false;
 
-// ---- Forward declarations ----
-void connectToWiFi();
-bool waitForTimeSync(uint32_t timeoutMs);
+enum class WifiState { IDLE, CONNECTING, CONNECTED };
+static WifiState wifiState = WifiState::IDLE;
+
+static bool introActive = true;
+static int introFrame = 0;
+static uint32_t introFrameMillis = 0;
+
+struct MoonResult {
+    bool success;
+    double age;
+    int httpCode;
+};
+
+static QueueHandle_t moonResultQueue = nullptr;
+static TaskHandle_t moonTaskHandle = nullptr;
+
+bool timeIsValid();
+void serviceWiFi();
+void serviceClock();
+void serviceIntro();
+void serviceMoonFetch();
+void moonFetchTask(void *parameter);
 void updateClockLabels();
-void updateMoonData();
 String getMoonPhase(double age);
 int getMoonImageIndex(double age);
 void setMoonImage(int index);
-void playMoonIntroAnimation();
 
 void setup()
 {
     Serial.begin(115200);
-    tft.begin();
-    tft.setRotation(2); // Try 0 if image is upside down.
-    tft.fillScreen(TFT_BLACK);
-    lv_init();
-    lv_disp_draw_buf_init(&draw_buf, buf1, NULL, 240 * 40);
+    Serial.println("\nQuill Moon Clock v1.1 - non-blocking");
 
+    tft.begin();
+    tft.setRotation(0);
+    tft.fillScreen(TFT_BLACK);
+
+    lv_init();
+    lv_disp_draw_buf_init(&draw_buf, buf1, nullptr, 240 * 40);
     lv_disp_drv_init(&disp_drv);
     disp_drv.hor_res = 240;
     disp_drv.ver_res = 240;
@@ -101,69 +116,251 @@ void setup()
     lv_disp_drv_register(&disp_drv);
 
     ui_init();
-    lv_task_handler(); 
-    playMoonIntroAnimation();
-    connectToWiFi();
-    configTzTime(TIMEZONE, NTP_SERVER);
-    waitForTimeSync(15000); 
-    updateMoonData();
+    lv_task_handler();
+
+    moonResultQueue = xQueueCreate(1, sizeof(MoonResult));
+    if (!moonResultQueue) {
+        Serial.println("ERROR: could not create moon result queue.");
+    }
+
+    // Start networking, but do not wait for it.
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    wifiAttemptMillis = millis();
+    wifiState = WifiState::CONNECTING;
+    Serial.println("Wi-Fi connection started in background.");
+
+    introFrameMillis = millis();
     lastClockMillis = millis();
-    lastMoonMillis = millis();
-    Serial.println("Setup complete.");
+    // Allow first moon fetch as soon as time + Wi-Fi are ready.
+    lastMoonAttemptMillis = millis() - MOON_RETRY_MS;
+
+    Serial.println("Setup complete; UI loop running.");
 }
 
 void loop()
 {
     lv_task_handler();
-    uint32_t now = millis();
-    if (now - lastClockMillis >= CLOCK_UPDATE_MS) {
-        lastClockMillis = now;
-        updateClockLabels();
-    }
-
-    if (now - lastMoonMillis >= (moonDataValid ? MOON_UPDATE_MS : MOON_RETRY_MS)) {
-        lastMoonMillis = now;
-        updateMoonData();
-    }
-
-    delay(5);
+    serviceIntro();
+    serviceWiFi();
+    serviceClock();
+    serviceMoonFetch();
+    delay(5); // yield; not a network wait
 }
 
-void connectToWiFi()
+bool timeIsValid()
 {
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-    Serial.print("Connecting to WiFi");
-    uint32_t start = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - start < 20000) {
-        delay(500);
-        Serial.print(".");
-    }
-    if (WiFi.status() == WL_CONNECTED) {
-        Serial.println(" connected.");
-    } else {
-        Serial.println(" failed to connect within 20s -- continuing without WiFi for now.");
-    }
-}
-
-bool waitForTimeSync(uint32_t timeoutMs)
-{
-    Serial.print("Waiting for NTP time sync");
-    uint32_t start = millis();
     time_t now;
     struct tm timeinfo;
+    time(&now);
+    localtime_r(&now, &timeinfo);
+    return timeinfo.tm_year >= (2023 - 1900);
+}
 
-    while (millis() - start < timeoutMs) {
-        time(&now);
-        localtime_r(&now, &timeinfo);
-        if (timeinfo.tm_year >= (2023 - 1900)) {
-            Serial.println(" synced.");
-            return true;
+void serviceWiFi()
+{
+    uint32_t now = millis();
+    wl_status_t status = WiFi.status();
+
+    if (status == WL_CONNECTED) {
+        if (wifiState != WifiState::CONNECTED) {
+            wifiState = WifiState::CONNECTED;
+            Serial.print("Wi-Fi connected. IP: ");
+            Serial.println(WiFi.localIP());
+
+            if (!ntpConfigured) {
+                configTzTime(TIMEZONE, NTP_SERVER, "time.google.com", "time.cloudflare.com");
+                ntpConfigured = true;
+                Serial.println("NTP configured; sync will complete in background.");
+            }
         }
-        delay(500);
-        Serial.print(".");
+        return;
     }
-    Serial.println(" timed out -- will keep retrying in the background.");
-    return false;
+
+    if (wifiState == WifiState::CONNECTED) {
+        Serial.println("Wi-Fi connection lost; will reconnect in background.");
+        wifiState = WifiState::IDLE;
+        wifiAttemptMillis = now - WIFI_RETRY_MS;
+    }
+
+    if (wifiState == WifiState::CONNECTING) {
+        if (now - wifiAttemptMillis >= WIFI_CONNECT_TIMEOUT_MS) {
+            Serial.println("Wi-Fi connect timeout; UI continues. Will retry later.");
+            WiFi.disconnect();
+            wifiState = WifiState::IDLE;
+            wifiAttemptMillis = now;
+        }
+        return;
+    }
+
+    if (now - wifiAttemptMillis >= WIFI_RETRY_MS) {
+        Serial.println("Retrying Wi-Fi in background.");
+        WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+        wifiAttemptMillis = now;
+        wifiState = WifiState::CONNECTING;
+    }
+}
+
+void serviceClock()
+{
+    uint32_t now = millis();
+    if (now - lastClockMillis < CLOCK_UPDATE_MS) return;
+    lastClockMillis = now;
+
+    bool valid = timeIsValid();
+    if (valid && !timeWasValid) {
+        Serial.println("NTP time is valid.");
+        timeWasValid = true;
+        // Permit an immediate moon fetch after initial time sync.
+        lastMoonAttemptMillis = now - MOON_RETRY_MS;
+    }
+    if (valid) updateClockLabels();
+}
+
+void serviceIntro()
+{
+    if (!introActive) return;
+
+    uint32_t now = millis();
+    if (now - introFrameMillis < INTRO_FRAME_MS) return;
+
+    introFrameMillis = now;
+
+    setMoonImage(introFrame++);
+
+    // Render this animation frame immediately.
+    lv_refr_now(nullptr);
+
+    if (introFrame >= 30) {
+        introActive = false;
+        Serial.println("Moon intro animation complete.");
+    }
+}
+
+void serviceMoonFetch()
+{
+    // Collect worker result on main task; LVGL calls remain here only.
+   if (moonResultQueue) {
+
+    MoonResult result;
+
+    if (xQueueReceive(moonResultQueue, &result, 0) == pdTRUE) {
+
+        moonTaskHandle = nullptr;
+
+        if (result.success && !introActive) {
+
+            Serial.printf(
+                "Moon age: %.3f days\n",
+                result.age
+            );
+
+            String phaseName =
+                getMoonPhase(result.age);
+
+            int moonIndex =
+                getMoonImageIndex(result.age);
+
+            Serial.printf(
+                "Moon phase: %s, frame: %d\n",
+                phaseName.c_str(),
+                moonIndex
+            );
+
+            lv_label_set_text(
+                ui_phase,
+                phaseName.c_str()
+            );
+
+            lv_obj_invalidate(ui_phase);
+
+            setMoonImage(moonIndex);
+
+            // Force LVGL to render the new
+            // phase label and moon image.
+            lv_refr_now(nullptr);
+
+            moonDataValid = true;
+
+        } else {
+
+            Serial.printf(
+                "Moon fetch failed, HTTP code: %d; will retry.\n",
+                result.httpCode
+            );
+        }
+    }
+}
+
+
+
+
+    if (moonTaskHandle != nullptr || !moonResultQueue) return;
+  //  if (introActive) return;  // Let startup animation finish first
+    if (WiFi.status() != WL_CONNECTED || !timeIsValid()) return;
+
+    uint32_t now = millis();
+    uint32_t interval = moonDataValid ? MOON_UPDATE_MS : MOON_RETRY_MS;
+    if (now - lastMoonAttemptMillis < interval) return;
+    lastMoonAttemptMillis = now;
+
+    BaseType_t ok = xTaskCreate(
+        moonFetchTask,
+        "moonFetch",
+        8192,
+        nullptr,
+        1,
+        &moonTaskHandle
+    );
+
+    if (ok != pdPASS) {
+        moonTaskHandle = nullptr;
+        Serial.println("Could not start moon fetch worker.");
+    }
+}
+
+void moonFetchTask(void *parameter)
+{
+    MoonResult result{false, 0.0, -1};
+
+    time_t now;
+    struct tm timeinfo;
+    time(&now);
+    localtime_r(&now, &timeinfo);
+
+    char dateStr[25];
+    if (strftime(dateStr, sizeof(dateStr), "%Y-%m-%dT%H:%M", &timeinfo) != 0) {
+        String url = "https://svs.gsfc.nasa.gov/api/dialamoon/";
+        url += dateStr;
+        Serial.print("Background moon fetch: ");
+        Serial.println(url);
+
+        WiFiClientSecure client;
+        client.setInsecure(); // retained from upstream; production can pin/verify CA later
+        client.setTimeout(10000);
+
+        HTTPClient http;
+        http.setTimeout(10000);
+        if (http.begin(client, url)) {
+            result.httpCode = http.GET();
+            if (result.httpCode == HTTP_CODE_OK) {
+                String payload = http.getString();
+                DynamicJsonDocument doc(2048);
+                DeserializationError err = deserializeJson(doc, payload);
+                if (!err && doc["age"].is<double>()) {
+                    result.age = doc["age"].as<double>();
+                    result.success = true;
+                } else if (err) {
+                    Serial.print("JSON parse failed: ");
+                    Serial.println(err.c_str());
+                }
+            }
+            http.end();
+        }
+    }
+
+    if (moonResultQueue) xQueueOverwrite(moonResultQueue, &result);
+    vTaskDelete(nullptr);
 }
 
 void updateClockLabels()
@@ -173,22 +370,16 @@ void updateClockLabels()
     time(&now);
     localtime_r(&now, &timeinfo);
 
-    if (timeinfo.tm_year < (2023 - 1900)) {
-        // Time not synced yet
-        return;
-    }
-
-    char timeStr[9]; // "HH:MM:SS"
+    char timeStr[9];
     snprintf(timeStr, sizeof(timeStr), "%02d:%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
 
-    char dateStr[11]; // "13 Aug 26"
+    char dateStr[11];
     strftime(dateStr, sizeof(dateStr), "%d %b %y", &timeinfo);
 
     lv_label_set_text(ui_time, timeStr);
     lv_label_set_text(ui_date, dateStr);
     lv_obj_invalidate(ui_time);
     lv_obj_invalidate(ui_date);
-    lv_refr_now(NULL);
 }
 
 void setMoonImage(int index)
@@ -197,101 +388,24 @@ void setMoonImage(int index)
     if (index > 29) index = 29;
     lv_img_set_src(ui_img_moon, moon_frames[index]);
     lv_obj_invalidate(ui_img_moon);
-    lv_refr_now(NULL); 
-}
-
-void playMoonIntroAnimation()
-{
-    const uint16_t frameDelayMs = 100; 
-    for (int i = 0; i < 30; i++) {
-        setMoonImage(i);
-        delay(frameDelayMs);
-    }
-}
-
-void updateMoonData()
-{
-    if (WiFi.status() != WL_CONNECTED) {
-        Serial.println("WiFi not connected. Skipping moon data fetch.");
-        return;
-    }
-
-    time_t now;
-    struct tm timeinfo;
-    time(&now);
-    localtime_r(&now, &timeinfo);
-
-    if (timeinfo.tm_year < (2023 - 1900)) {
-        Serial.println("Time not set yet. Skipping moon data fetch.");
-        return;
-    }
-
-    char dateStr[25];
-    if (strftime(dateStr, sizeof(dateStr), "%Y-%m-%dT%H:%M", &timeinfo) == 0) {
-        Serial.println("Failed to format date string.");
-        return;
-    }
-
-    String url = "https://svs.gsfc.nasa.gov/api/dialamoon/";
-    url += dateStr;
-
-    Serial.print("Fetching moon data: ");
-    Serial.println(url);
-
-    WiFiClientSecure client;
-    client.setInsecure();
-
-    HTTPClient http;
-    http.begin(client, url);
-    int httpCode = http.GET();
-
-    if (httpCode == HTTP_CODE_OK) {
-        String payload = http.getString();
-
-        DynamicJsonDocument doc(2048);
-        DeserializationError err = deserializeJson(doc, payload);
-        if (err) {
-            Serial.print("JSON parse failed: ");
-            Serial.println(err.c_str());
-            http.end();
-            return;
-        }
-
-        double age = doc["age"].as<double>();
-        Serial.printf("Moon age: %.3f days\n", age);
-
-        String phaseName = getMoonPhase(age);
-        lv_label_set_text(ui_phase, phaseName.c_str());
-        lv_obj_invalidate(ui_phase);
-        lv_refr_now(NULL);
-
-        setMoonImage(getMoonImageIndex(age));
-        moonDataValid = true;
-
-    } else {
-        Serial.printf("Failed to fetch moon data, HTTP code: %d\n", httpCode);
-    }
-
-    http.end();
 }
 
 String getMoonPhase(double age)
 {
     if (age < 1.84566) return "New Moon";
-    else if (age < 5.53699) return "Waxing Crescent";
-    else if (age < 9.22831) return "First Quarter";
-    else if (age < 12.91963) return "Waxing Gibbous";
-    else if (age < 16.61096) return "Full Moon";
-    else if (age < 20.30228) return "Waning Gibbous";
-    else if (age < 23.99361) return "Last Quarter";
-    else return "Waning Crescent";
+    if (age < 5.53699) return "Waxing Crescent";
+    if (age < 9.22831) return "First Quarter";
+    if (age < 12.91963) return "Waxing Gibbous";
+    if (age < 16.61096) return "Full Moon";
+    if (age < 20.30228) return "Waning Gibbous";
+    if (age < 23.99361) return "Last Quarter";
+    return "Waning Crescent";
 }
 
 int getMoonImageIndex(double age)
 {
-
-    int idx = (int)(age / 29.53 * 30);
-    if (idx > 29) idx = 29;
+    int idx = (int)(age / 29.53 * 30.0);
     if (idx < 0) idx = 0;
+    if (idx > 29) idx = 29;
     return idx;
 }

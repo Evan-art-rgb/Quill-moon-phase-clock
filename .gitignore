@@ -1,4 +1,4 @@
 .pio/
 .vscode/
-build/
-credentials.h
+include/secrets.h
+*.zip
